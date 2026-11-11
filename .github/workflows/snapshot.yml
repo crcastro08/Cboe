@@ -1,0 +1,24 @@
+name: snapshot
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "45 12 * * 1-5"   # ~7:45 ET (invierno) / 8:45 ET (verano)
+    - cron: "30 22 * * 1-5"   # ~17:30 ET (invierno) / 18:30 ET (verano)
+permissions:
+  contents: write
+jobs:
+  snap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests pandas
+      - run: python snapshot.py
+      - run: |
+          git config user.name "snapshot-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add snapshots
+          git commit -m "snapshot $(date -u +%F_%H%M)" || exit 0
+          git push
