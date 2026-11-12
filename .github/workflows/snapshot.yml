@@ -1,24 +1,54 @@
 name: snapshot
+
 on:
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Guardar aunque la sesion este abierta (snapshot manual)"
+        type: boolean
+        default: false
   schedule:
-    - cron: "45 12 * * 1-5"   # ~7:45 ET (invierno) / 8:45 ET (verano)
-    - cron: "30 22 * * 1-5"   # ~17:30 ET (invierno) / 18:30 ET (verano)
+    # Lunes a viernes, antes de la apertura de EE.UU. (UTC):
+    #   invierno: 7:20 / 7:50 / 8:15 ET   |   verano: 8:20 / 8:50 / 9:15 ET (apertura 9:30 ET)
+    # Si una ejecucion ya guardo la sesion o el OI aun no cambia, las demas no hacen nada.
+    - cron: "20 12 * * 1-5"
+    - cron: "50 12 * * 1-5"
+    - cron: "15 13 * * 1-5"
+
 permissions:
   contents: write
+
+concurrency:
+  group: snapshot
+  cancel-in-progress: false
+
 jobs:
   snap:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - run: pip install requests pandas
-      - run: python snapshot.py
-      - run: |
+
+      - name: Descargar y guardar snapshot
+        env:
+          FORCE: ${{ github.event.inputs.force == 'true' && '1' || '0' }}
+        run: python snapshot.py
+
+      - name: Subir al repositorio
+        run: |
           git config user.name "snapshot-bot"
-          git config user.email "bot@users.noreply.github.com"
+          git config user.email "snapshot-bot@users.noreply.github.com"
           git add snapshots
-          git commit -m "snapshot $(date -u +%F_%H%M)" || exit 0
+          if git diff --cached --quiet; then
+            echo "Nada que guardar en esta ejecucion."
+            exit 0
+          fi
+          git commit -m "snapshot $(date -u +%F_%H%M)"
+          git pull --rebase
           git push
