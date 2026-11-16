@@ -43,8 +43,14 @@ def fetch(retries=3):
 
 
 def session_of(last_trade_time):
-    """Fecha de la ultima sesion con operaciones (hora de Nueva York)."""
+    """Fecha de la ultima sesion regular (9:30-16:15 hora de Nueva York).
+
+    Se ignoran las operaciones nocturnas (GTH): el SPX negocia casi las 24 h y un trade de
+    madrugada llevaria la fecha de hoy aunque la sesion regular de hoy aun no empiece.
+    """
     t = pd.to_datetime(last_trade_time, errors="coerce").dropna()
+    hm = t.dt.hour * 60 + t.dt.minute
+    t = t[(hm >= 9 * 60 + 30) & (hm <= 16 * 60 + 15)]
     return t.dt.date.max() if len(t) else None
 
 
