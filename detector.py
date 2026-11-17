@@ -6,7 +6,7 @@ y las agrupa en verticales, butterflies, iron butterflies/condors y straddles/st
 NO determina si la estructura fue comprada o vendida: es una hipotesis, no un dato.
 
 Uso:
-  python detector.py --dir snapshots                       # elige solo los 2 snapshots
+  python detector.py --dir snapshots                       # usa los 2 ultimos cierres (*_pm.csv.gz)
   python detector.py --prev snapshots/A.csv.gz --cur snapshots/B.csv.gz
   python detector.py --dir snapshots --closes              # busca cierres (OI baja)
 """
@@ -21,15 +21,11 @@ import pandas as pd
 
 # ----------------------------------------------------------------- carga
 def pick_files(folder):
-    files = sorted(Path(folder).glob("*.csv.gz"))
-    if not files:
-        sys.exit(f"No hay archivos .csv.gz en {folder}")
-    ams = [f for f in files if "_am" in f.name]      # el OI nuevo solo esta en los de la manana
-    cur = (ams or files)[-1]
-    older = [f for f in files if f.name[:10] < cur.name[:10]]
-    if not older:
-        sys.exit("Falta un snapshot de un dia anterior para calcular el cambio de OI.")
-    return older[-1], cur
+    """Cierres diarios (*_pm.csv.gz): cada archivo trae el OI de ese dia y el volumen de ese dia."""
+    files = sorted(Path(folder).glob("*_pm.csv.gz"))
+    if len(files) < 2:
+        sys.exit(f"Se necesitan al menos 2 snapshots de cierre (*_pm.csv.gz) en {folder}.")
+    return files[-2], files[-1]
 
 
 def load(path):
@@ -43,10 +39,8 @@ def checks(prev, cur):
     cap_cur = pd.Timestamp(cur["captured_utc"].iloc[0]).tz_convert("UTC")
     gap = int(np.busday_count(cap_prev.date(), cap_cur.date()))
     if gap > 1:
-        print(f"AVISO: el cambio de OI abarca {gap} dias habiles (faltan snapshots o hay feriado).")
-    if cap_cur.hour + cap_cur.minute / 60 >= 13.5:
-        print("AVISO: el snapshot actual se tomo durante o despues de la sesion; "
-              "su OI aun no incluye las operaciones de ese dia. Usa uno de la manana.")
+        print(f"AVISO: el cambio de OI abarca {gap} dias habiles (faltan snapshots o hay feriado); "
+              "el volumen es solo el del ultimo dia del archivo anterior.")
     return cap_cur
 
 
@@ -61,28 +55,31 @@ def bucket_of(dte):
     return "otros"
 
 
+def pair_frame(prev, cur, sign):
+    """ΔOI = OI(cur) - OI(prev). Ese cambio refleja lo operado en la sesion de `prev`, asi que el
+    volumen, los trades y las cotizaciones son los del archivo `prev`."""
+    m = prev.merge(cur[["option", "open_interest"]], on="option", suffixes=("_prev", ""))
+    m["doi"] = sign * (m["open_interest"] - m["open_interest_prev"])
+    m["mid"] = (m["bid"] + m["ask"]) / 2
+    return m
+
+
 def history_thresholds(folder, cur_path, sign, a):
     """Distribucion historica de aumentos de OI por (root, tramo de DTE).
 
-    Para cada dia anterior al actual se compara su snapshot de la manana contra el ultimo
-    snapshot del dia previo y se guardan los ΔOI positivos de contratos con volumen.
+    Recorre pares consecutivos de cierres anteriores al actual y guarda los ΔOI positivos de
+    contratos con volumen.
     """
-    files = sorted(Path(folder).glob("*.csv.gz"))
-    by_date = {}
-    for f in files:
-        by_date.setdefault(f.name[:10], []).append(f)
-    dates = sorted(by_date)
+    files = sorted(Path(folder).glob("*_pm.csv.gz"))
     cur_date = Path(cur_path).name[:10]
     samples = []
-    for i, d in enumerate(dates):
-        if i == 0 or d >= cur_date:
-            continue
-        am = [f for f in by_date[d] if "_am" in f.name]
-        if not am or int(np.busday_count(dates[i - 1], d)) > 1:
-            continue                                  # sin snapshot am o con hueco de dias
-        p, c = load(sorted(by_date[dates[i - 1]])[-1]), load(am[0])
-        mm = p[["option", "open_interest"]].merge(c, on="option", suffixes=("_prev", ""))
-        mm["doi"] = sign * (mm["open_interest"] - mm["open_interest_prev"])
+    for pf, cf in zip(files[:-1], files[1:]):
+        if cf.name[:10] >= cur_date:
+            break
+        if int(np.busday_count(pf.name[:10], cf.name[:10])) > 1:
+            continue                                  # hueco de dias: no es un cambio de un dia
+        p, c = load(pf), load(cf)
+        mm = pair_frame(p, c, sign)
         mm = mm[(mm["doi"] > 0) & (mm["volume"] > 0)].copy()
         cap = pd.Timestamp(pd.Timestamp(c["captured_utc"].iloc[0]).date())
         mm["bucket"] = (mm["exp"] - cap).dt.days.map(bucket_of)
@@ -103,9 +100,7 @@ def history_thresholds(folder, cur_path, sign, a):
 
 # ------------------------------------------------------------- patas
 def build_legs(prev, cur, sign, a, thr, cap_date):
-    m = prev[["option", "open_interest"]].merge(cur, on="option", suffixes=("_prev", ""))
-    m["doi"] = sign * (m["open_interest"] - m["open_interest_prev"])
-    m["mid"] = (m["bid"] + m["ask"]) / 2
+    m = pair_frame(prev, cur, sign)
     m["bucket"] = (m["exp"] - cap_date).dt.days.map(bucket_of)
     keys = list(zip(m["root"], m["bucket"]))
     m["thr_min"] = [thr.get(k, {}).get("min", a.min_oi) for k in keys]
@@ -312,7 +307,7 @@ def main():
     print(f"Anterior: {pf.name}\nActual:   {cf.name}")
     prev, cur = load(pf), load(cf)
     cap = checks(prev, cur)
-    t = cur["ltt"].dropna()                           # dia al que pertenece el volumen:
+    t = prev["ltt"].dropna()                          # el volumen y los trades son los de prev:
     hm = t.dt.hour * 60 + t.dt.minute                 # ultima sesion regular (ignora trades nocturnos)
     session = t[(hm >= 570) & (hm <= 975)].dt.date.max()
     spot = float(cur["spot"].iloc[0])
