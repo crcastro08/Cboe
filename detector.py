@@ -6,7 +6,7 @@ y las agrupa en verticales, butterflies, iron butterflies/condors y straddles/st
 NO determina si la estructura fue comprada o vendida: es una hipotesis, no un dato.
 
 Uso:
-  python detector.py --dir snapshots                       # elige solo los 2 snapshots
+  python detector.py --dir snapshots                       # usa los 2 ultimos cierres (*_pm.csv.gz)
   python detector.py --prev snapshots/A.csv.gz --cur snapshots/B.csv.gz
   python detector.py --dir snapshots --closes              # busca cierres (OI baja)
 """
@@ -21,14 +21,11 @@ import pandas as pd
 
 # ----------------------------------------------------------------- carga
 def pick_files(folder):
-    files = sorted(Path(folder).glob("*.csv.gz"))
-    if not files:
-        sys.exit(f"No hay archivos .csv.gz en {folder}")
-    cur = files[-1]
-    older = [f for f in files if f.name[:10] < cur.name[:10]]
-    if not older:
-        sys.exit("Falta un snapshot de un dia anterior para calcular el cambio de OI.")
-    return older[-1], cur
+    """Cierres diarios (*_pm.csv.gz): cada archivo trae el OI de ese dia y el volumen de ese dia."""
+    files = sorted(Path(folder).glob("*_pm.csv.gz"))
+    if len(files) < 2:
+        sys.exit(f"Se necesitan al menos 2 snapshots de cierre (*_pm.csv.gz) en {folder}.")
+    return files[-2], files[-1]
 
 
 def load(path):
@@ -42,19 +39,73 @@ def checks(prev, cur):
     cap_cur = pd.Timestamp(cur["captured_utc"].iloc[0]).tz_convert("UTC")
     gap = int(np.busday_count(cap_prev.date(), cap_cur.date()))
     if gap > 1:
-        print(f"AVISO: el cambio de OI abarca {gap} dias habiles (faltan snapshots o hay feriado).")
-    if cap_cur.hour + cap_cur.minute / 60 >= 13.5:
-        print("AVISO: el snapshot actual se tomo durante o despues de la sesion; "
-              "su OI aun no incluye las operaciones de ese dia. Usa uno de la manana.")
+        print(f"AVISO: el cambio de OI abarca {gap} dias habiles (faltan snapshots o hay feriado); "
+              "el volumen es solo el del ultimo dia del archivo anterior.")
     return cap_cur
 
 
-# ------------------------------------------------------------- patas
-def build_legs(prev, cur, sign, a):
-    m = prev[["option", "open_interest"]].merge(cur, on="option", suffixes=("_prev", ""))
+# ------------------------------------------------- umbrales por historico
+BUCKETS = [(2, 7, "2-7"), (8, 21, "8-21"), (22, 60, "22-60")]
+
+
+def bucket_of(dte):
+    for lo, hi, name in BUCKETS:
+        if lo <= dte <= hi:
+            return name
+    return "otros"
+
+
+def pair_frame(prev, cur, sign):
+    """ΔOI = OI(cur) - OI(prev). Ese cambio refleja lo operado en la sesion de `prev`, asi que el
+    volumen, los trades y las cotizaciones son los del archivo `prev`."""
+    m = prev.merge(cur[["option", "open_interest"]], on="option", suffixes=("_prev", ""))
     m["doi"] = sign * (m["open_interest"] - m["open_interest_prev"])
     m["mid"] = (m["bid"] + m["ask"]) / 2
-    legs = m[(m["doi"] >= a.min_oi) & (m["volume"] > 0)].copy()
+    return m
+
+
+def history_thresholds(folder, cur_path, sign, a):
+    """Distribucion historica de aumentos de OI por (root, tramo de DTE).
+
+    Recorre pares consecutivos de cierres anteriores al actual y guarda los ΔOI positivos de
+    contratos con volumen.
+    """
+    files = sorted(Path(folder).glob("*_pm.csv.gz"))
+    cur_date = Path(cur_path).name[:10]
+    samples = []
+    for pf, cf in zip(files[:-1], files[1:]):
+        if cf.name[:10] >= cur_date:
+            break
+        if int(np.busday_count(pf.name[:10], cf.name[:10])) > 1:
+            continue                                  # hueco de dias: no es un cambio de un dia
+        p, c = load(pf), load(cf)
+        mm = pair_frame(p, c, sign)
+        mm = mm[(mm["doi"] > 0) & (mm["volume"] > 0)].copy()
+        cap = pd.Timestamp(pd.Timestamp(c["captured_utc"].iloc[0]).date())
+        mm["bucket"] = (mm["exp"] - cap).dt.days.map(bucket_of)
+        samples.append(mm[["root", "bucket", "doi"]])
+    samples = samples[-a.window:]
+    if len(samples) < a.min_days:
+        return {}, len(samples)
+    h = pd.concat(samples)
+    thr = {}
+    for (root, b), g in h.groupby(["root", "bucket"]):
+        if len(g) < 30:
+            continue
+        mn = max(a.floor, float(np.percentile(g["doi"], a.pct_min)))
+        big = max(float(np.percentile(g["doi"], a.pct_big)), mn * 2)
+        thr[(root, b)] = dict(min=mn, big=big, n=len(g), dist=np.sort(g["doi"].to_numpy()))
+    return thr, len(samples)
+
+
+# ------------------------------------------------------------- patas
+def build_legs(prev, cur, sign, a, thr, cap_date):
+    m = pair_frame(prev, cur, sign)
+    m["bucket"] = (m["exp"] - cap_date).dt.days.map(bucket_of)
+    keys = list(zip(m["root"], m["bucket"]))
+    m["thr_min"] = [thr.get(k, {}).get("min", a.min_oi) for k in keys]
+    m["thr_big"] = [thr.get(k, {}).get("big", a.big) for k in keys]
+    legs = m[(m["doi"] >= m["thr_min"]) & (m["volume"] > 0)].copy()
     return m, legs
 
 
@@ -67,7 +118,8 @@ def score_structure(rows, weights, kind, session, a):
         return None
     sym = 1 - dev / a.tol
     unit = x.min()
-    size = float(np.clip(np.log10(unit / a.min_oi) / np.log10(a.big / a.min_oi), 0, 1))
+    lo, hi = float(rows["thr_min"].iloc[0]), float(rows["thr_big"].iloc[0])
+    size = float(np.clip(np.log10(max(unit, 1) / lo) / np.log10(hi / lo), 0, 1))
     vol = rows["volume"].to_numpy(float)
     conf = float(np.mean(np.minimum(s, vol) / np.maximum(s, vol)))
     # sincronia: fraccion de patas cuyo ultimo trade esta a <=60 s de otra pata (mismo dia de sesion)
@@ -155,7 +207,7 @@ def resolve(cands):
 
 
 # -------------------------------------------------------------- salida
-def to_table(chosen, session_dte):
+def to_table(chosen, session_dte, thr):
     rows = []
     for n, c in enumerate(sorted(chosen, key=lambda c: -c["score"]), 1):
         r = c["rows"].sort_values(["cp", "strike"], ascending=[False, True])
@@ -167,6 +219,10 @@ def to_table(chosen, session_dte):
             contratos_unidad=c["unit"], score=c["score"], size=c["size"], simetria=c["sym"],
             conf_volumen=c["vol_conf"], sincronia=c["sync"],
         ))
+        if thr:
+            d = thr.get((c["root"], bucket_of(rows[-1]["dte"])))
+            rows[-1]["pct_hist"] = (round(100 * np.searchsorted(d["dist"], c["unit"]) / len(d["dist"]), 1)
+                                    if d else None)
     return pd.DataFrame(rows)
 
 
@@ -231,8 +287,14 @@ def main():
     p.add_argument("--cur")
     p.add_argument("--out", default="detections")
     p.add_argument("--closes", action="store_true", help="buscar cierres (baja de OI)")
-    p.add_argument("--min-oi", type=float, default=500, help="aumento minimo de OI por pata")
-    p.add_argument("--big", type=float, default=4000, help="tamano que da puntuacion maxima")
+    p.add_argument("--min-oi", type=float, default=500, help="umbral fijo (sin historico suficiente)")
+    p.add_argument("--big", type=float, default=4000, help="tamano fijo de puntuacion maxima (sin historico)")
+    p.add_argument("--no-history", action="store_true", help="forzar umbrales fijos")
+    p.add_argument("--min-days", type=int, default=10, help="dias de historico minimos para usar umbrales relativos")
+    p.add_argument("--window", type=int, default=60, help="maximo de dias de historico a usar")
+    p.add_argument("--pct-min", type=float, default=97, help="percentil que fija el aumento minimo por pata")
+    p.add_argument("--pct-big", type=float, default=99.5, help="percentil que da puntuacion maxima de tamano")
+    p.add_argument("--floor", type=float, default=200, help="minimo absoluto de OI incluso con historico")
     p.add_argument("--tol", type=float, default=0.25, help="diferencia relativa maxima entre patas")
     p.add_argument("--min-score", type=float, default=50)
     p.add_argument("--max-width", type=float, default=200,
@@ -245,15 +307,25 @@ def main():
     print(f"Anterior: {pf.name}\nActual:   {cf.name}")
     prev, cur = load(pf), load(cf)
     cap = checks(prev, cur)
-    session = cur["ltt"].dropna().dt.date.max()      # dia al que pertenece el volumen
+    t = prev["ltt"].dropna()                          # el volumen y los trades son los de prev:
+    hm = t.dt.hour * 60 + t.dt.minute                 # ultima sesion regular (ignora trades nocturnos)
+    session = t[(hm >= 570) & (hm <= 975)].dt.date.max()
     spot = float(cur["spot"].iloc[0])
 
     sign = -1 if a.closes else 1
-    m, legs = build_legs(prev, cur, sign, a)
-    print(f"Contratos comparables: {len(m):,} | patas candidatas (ΔOI>={a.min_oi:g} y volumen>0): {len(legs):,}")
+    thr, ndays = ({}, 0) if a.no_history else history_thresholds(a.dir, cf, sign, a)
+    if thr:
+        print(f"Umbrales relativos con {ndays} dias de historico (p{a.pct_min:g} minimo, p{a.pct_big:g} tamano maximo):")
+        print(pd.DataFrame([dict(root=k[0], dte=k[1], min_oi=round(v["min"]), tam_max=round(v["big"]), n=v["n"])
+                            for k, v in sorted(thr.items())]).to_string(index=False))
+    else:
+        print(f"Historico insuficiente ({ndays} dias, se piden {a.min_days}): umbrales fijos "
+              f"(min {a.min_oi:g}, tamano maximo {a.big:g}). Resultados provisionales.")
+    m, legs = build_legs(prev, cur, sign, a, thr, pd.Timestamp(cap.date()))
+    print(f"Contratos comparables: {len(m):,} | patas candidatas: {len(legs):,}")
 
     chosen, used = resolve(find_structures(legs, session, a))
-    table = to_table(chosen, pd.Timestamp(cap.date()))
+    table = to_table(chosen, pd.Timestamp(cap.date()), thr)
     what = "cierres" if a.closes else "aperturas"
     print(f"\n{len(table)} estructuras ({what}) con score >= {a.min_score:g}. "
           "Lado comprado/vendido: desconocido.\n")
@@ -271,6 +343,9 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     tag = f"{cap.date()}{'_cierres' if a.closes else ''}"
     table.to_csv(out / f"structures_{tag}.csv", index=False)
+    if thr:
+        pd.DataFrame([dict(root=k[0], dte=k[1], min_oi=v["min"], tam_max=v["big"], n=v["n"])
+                      for k, v in sorted(thr.items())]).to_csv(out / f"thresholds_{tag}.csv", index=False)
     make_chart(m, chosen, table, spot,
                f"Cambio de OI SPX/SPXW: {pf.name[:10]} a {cf.name[:10]} ({what}; ◆ = estructuras detectadas)",
                str(out / f"chart_{tag}.html"))
